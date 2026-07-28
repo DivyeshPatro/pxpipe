@@ -1173,8 +1173,25 @@ async function main(): Promise<void> {
         e.usage !== undefined
           ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
           : '';
+      // Split the wall clock into the half we control and the half we don't:
+      // `tx` is local render+encode, the remainder is upstream. Without this the
+      // duration alone can't distinguish our CPU from a slow provider.
+      //
+      // `fb` further splits the upstream half: request start → response headers,
+      // so it covers upload + provider queue/processing but NOT generation. With
+      // all three, `fb - tx` isolates how much a large image payload costs to put
+      // on the wire, which is the number that decides whether shrinking IDATs pays.
+      const timingParts = [`${e.durationMs}ms`];
+      if (e.transformMs !== undefined) {
+        timingParts.push(
+          `tx=${e.transformMs}ms`,
+          `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
+        );
+      }
+      if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
+      const timing = timingParts.join(' ');
       console.log(
-        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
+        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
       );
 
       // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;
