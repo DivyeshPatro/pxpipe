@@ -54,12 +54,22 @@ TARGET_PORT="${PORT:-47821}"
 # may restart: it owns a child process (often the Claude Code session running
 # this very script). SIGTERM to warp takes the child with it, so the restart
 # would kill the caller. Serving proxies only.
-PIDS_RAW=$(pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null | while read -r p; do
-  case "$(ps -o args= -p "$p" 2>/dev/null)" in
-    *"cli.js warp"*) ;;
-    *) echo "$p" ;;
-  esac
-done || true)
+#
+# NOTE: the filter is a function, not an inline `case` inside `$(...)`. bash 3.2
+# (still the default /bin/bash on macOS) mis-parses a `case` pattern's closing
+# `)` as the end of the command substitution, giving:
+#     syntax error near unexpected token `;;'
+list_serving_pids() {
+  local p args
+  pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null | while read -r p; do
+    args=$(ps -o args= -p "$p" 2>/dev/null)
+    case "$args" in
+      *"cli.js warp"*) ;;
+      *) echo "$p" ;;
+    esac
+  done
+}
+PIDS_RAW=$(list_serving_pids || true)
 if [ -n "$PIDS_RAW" ]; then
   # Convert to space-separated list, sorted numerically for stable output.
   PIDS=$(echo "$PIDS_RAW" | tr '\n' ' ' | xargs -n1 | sort -n | tr '\n' ' ')
