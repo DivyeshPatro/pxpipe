@@ -4,7 +4,44 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
-## Unreleased
+## 0.12.0 — 2026-08-06
+
+### Fixed
+- The per-turn billing header no longer lands in the cached prefix. It changed
+  on every turn and sat ahead of the stable content, so each turn invalidated
+  the prefix behind it and forced a full re-read. This was the dominant source
+  of cache churn (#180, #161).
+- Tag scanning walks by index instead of backtracking regexes, so a pattern
+  that only matched the first occurrence no longer leaves later tags in the
+  imaged slab (#176).
+- Refusals and empty messages no longer force page breaks in OpenAI history
+  collapse (#178).
+- `keepTail:0` in mixed Responses collapse protected every message instead of
+  none, defeating the collapse entirely (#154).
+- System pins now appear in the Anthropic pin listing.
+- `restart` no longer puts a `case` inside `$( )`, which breaks macOS bash 3.2.
+
+### Added
+- `warp` runs agents through a CONNECT proxy instead of overriding
+  `ANTHROPIC_BASE_URL`, so agents that ignore the env var are still routed
+  (#156).
+- `warp` matches routes on host:port and accepts `--route` (#175).
+- Pin commands are read from the system prompt, and pin instructions are
+  placed where the model actually reads them (#155).
+
+### Changed
+- `claude-opus-5` is no longer in the default model list (#163).
+- `warp` takes the child process down with it on exit.
+
+### Security
+- Added a disclosure policy, a threat model, and a CI audit gate (#164).
+- Pinned trusted supply-chain inputs: actions by immutable SHA, exact Node and
+  npm versions, `--frozen-lockfile --ignore-scripts`, and a release gate that
+  verifies the tag matches `package.json` and descends from the default
+  branch (#169).
+- Bumped postcss to 8.5.24 (GHSA-r28c-9q8g-f849).
+
+## 0.11.0 — 2026-07-25
 
 ### Changed
 - Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
