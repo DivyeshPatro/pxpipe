@@ -3,6 +3,7 @@
  * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
+import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
@@ -1558,6 +1559,21 @@ export function createProxy(config: ProxyConfig = {}) {
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
     ]).then(([usage, errorBody, measurement, stopReason]) => {
+      // A rejected request never populated a prefix cache, so the append-only
+      // freeze this session was protecting protects nothing: let the next turn
+      // re-cut the grid for density instead of preserving dead bytes.
+      if (responseLeftNoCache(upstreamRes.status, errorBody)) {
+        markCacheDead(info?.firstUserSha8);
+      }
+      // Feed the provider's own cache accounting back into the session store. A
+      // read proves the prefix was live; a create proves one was just written.
+      // Either way the next turn must not re-cut the grid — which the wall clock
+      // alone could not tell, and got wrong on most gaps that mattered.
+      noteCacheOutcome(
+        info?.firstUserSha8,
+        usage?.cache_read_input_tokens,
+        usage?.cache_creation_input_tokens,
+      );
       fire(
         upstreamRes.status,
         info,

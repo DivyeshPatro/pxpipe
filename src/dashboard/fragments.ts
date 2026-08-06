@@ -410,6 +410,14 @@ export interface ContextMapData {
   // on the same cache state as the image path; no wall-clock-only inference.
   output: number;
   imageCount: number;
+  /** Image blocks the CLIENT sent. They spend from the provider's cap exactly
+   *  like ours, so they explain a turn that compressed less than usual. */
+  nativeImages?: number;
+  /** Image blocks really on the wire. Lower than imageCount when the history
+   *  collapse absorbed messages that already carried our images. */
+  wireImages?: number;
+  /** Imaging steps that degraded to text because the cap was full. */
+  imageBudgetSkips?: number;
   baselineImagedTokens?: number;
   buckets: Partial<Record<string, number>>; // bucket → chars rendered to PNG
   imageIds: number[]; // image-ring ids for the gallery
@@ -555,6 +563,28 @@ export function renderContextMapFragment(
           : `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. ${rawPhrase}`;
   const title = isLatest ? 'Latest request' : 'Selected request';
 
+  // The provider caps a request at 100 image blocks and counts the CLIENT's
+  // images against the same limit. Three facts are worth showing, and only when
+  // they are true — a quiet turn should stay quiet:
+  //   - the client brought its own images (they shrank our room),
+  //   - we rendered more pages than we shipped (the collapse ate some),
+  //   - we gave up on imaging something because the cap was full.
+  const capBits: string[] = [];
+  if ((c.nativeImages ?? 0) > 0) {
+    capBits.push(`${c.nativeImages} image${c.nativeImages === 1 ? '' : 's'} came from your side and count against the same 100-image request cap`);
+  }
+  if (c.wireImages !== undefined && c.wireImages < c.imageCount + (c.nativeImages ?? 0)) {
+    const absorbed = c.imageCount + (c.nativeImages ?? 0) - c.wireImages;
+    capBits.push(`${absorbed} rendered page${absorbed === 1 ? '' : 's'} never went out — the history collapse absorbed those messages (${c.wireImages} on the wire)`);
+  }
+  if ((c.imageBudgetSkips ?? 0) > 0) {
+    capBits.push(`${c.imageBudgetSkips} block${c.imageBudgetSkips === 1 ? '' : 's'} stayed as text because the image cap was full`);
+  }
+  const capNote = capBits.length
+    ? `<div class="split-note cap-note">${capBits.map(escapeHtml).join(' · ')}</div>`
+    : '';
+
+
   return (
     `<div class="ctxmap">` +
     `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline}</div>` +
@@ -564,6 +594,7 @@ export function renderContextMapFragment(
     `<div class="split-col split-img">` +
     `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
     (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
+    capNote +
     `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
@@ -766,7 +797,7 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const totalIn = (s.inputTokensTotal || 0) + (s.cacheCreateTokensTotal || 0) + (s.cacheReadTokensTotal || 0);
   const hitRateTok = totalIn > 0 ? ((s.cacheReadTokensTotal / totalIn) * 100).toFixed(1) + '%' : '-';
   const hitRateEv =
-    s.eventsWithBaseline > 0 ? ((s.cacheHitEvents / s.eventsWithBaseline) * 100).toFixed(1) + '%' : '-';
+    s.eventsWithUsage > 0 ? ((s.cacheHitEvents / s.eventsWithUsage) * 100).toFixed(1) + '%' : '-';
   const charRatio =
     s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
 
@@ -864,6 +895,10 @@ const CSS = `
     background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
     box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
   .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
+  .wordmark-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  /* Which machine is this? Two dashboards from two hosts look identical otherwise. */
+  .hostchip { font-size: 11.5px; font-weight: 600; color: var(--muted); padding: 1px 7px;
+    border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; }
   .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
   .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 
@@ -1041,6 +1076,10 @@ const CSS = `
   .ctx-lbl { color: var(--ink-2); } .ctx-val { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .muted-row { color: var(--muted); font-style: italic; }
   .split-note { font-size: 10.5px; color: var(--muted); margin-top: 7px; }
+  /* Cap notes explain a turn that compressed less than the user expects, so they
+     must read as a reason, not as fine print. Warm tint, not an error colour —
+     nothing here is broken. */
+  .cap-note { color: var(--ink); border-left: 2px solid var(--flame); padding-left: 7px; }
   .pages-title { font-size: 11px; color: var(--ink-2); margin: 12px 0 6px; }
   .pages { display: flex; flex-wrap: wrap; gap: 6px; max-height: 320px; overflow: auto;
     background: var(--surface-2); padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
@@ -1188,14 +1227,19 @@ const THEME_JS = `
   })();
 `;
 
-export function renderPage(port: number): string {
+/** `hostLabel` names the machine this proxy runs on. The dashboard is otherwise
+ *  byte-identical across hosts, so a tab opened against a remote host through
+ *  the tailnet front is indistinguishable from the local one - which is how a
+ *  session gets read on the wrong box. Empty label = render as before. */
+export function renderPage(port: number, hostLabel = ''): string {
+  const host = escapeHtml(hostLabel.trim());
   // hx-trigger="load, every Ns": paint on load then poll (2s live, 5s aggregates).
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>pxpipe — live dashboard</title>
+<title>${host ? `${host} · pxpipe dashboard` : 'pxpipe — live dashboard'}</title>
 <link rel="icon" href="${FAVICON}" />
 <style>${CSS}</style>
 <script>
@@ -1215,7 +1259,10 @@ export function renderPage(port: number): string {
   <div class="brand">
     <span class="flame-dot"></span>
     <div>
-      <div class="wordmark">pxpipe</div>
+      <div class="wordmark-row">
+        <div class="wordmark">pxpipe</div>
+        ${host ? `<span class="hostchip" title="proxy host">${host}</span>` : ''}
+      </div>
       <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
     </div>
   </div>
