@@ -76,6 +76,11 @@
     "node": ">=18"
   },
   "packageManager": "pnpm@10.21.0",
+  "pnpm": {
+    "overrides": {
+      "undici": "7.29.0"
+    }
+  },
   "license": "MIT",
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240512.0",
