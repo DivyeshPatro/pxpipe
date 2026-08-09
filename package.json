@@ -83,15 +83,15 @@
   },
   "license": "MIT",
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240512.0",
-    "@napi-rs/canvas": "^0.1.53",
-    "@types/node": "^20.12.0",
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@napi-rs/canvas": "^1.0.3",
+    "@types/node": "^26.1.2",
     "esbuild": "^0.28.1",
-    "tsx": "^4.10.0",
-    "typescript": "^5.4.0",
-    "vite": "^8.0.16",
-    "vitest": "^4.1.6",
-    "wrangler": "^4.92.0"
+    "tsx": "^4.23.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.93.0"
   },
   "dependencies": {
     "gpt-tokenizer": "^3.4.0"
