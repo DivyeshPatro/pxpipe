@@ -209,16 +209,21 @@ const OAUTH_IDENTITIES = [
 //
 // Image token cost is the serving model's DOCUMENTED per-image price, taken
 // from its profile via `visionTokens` (src/core/vision-cost.ts) — never a
-// hardcoded provider formula. Constants bias CONSERVATIVE: CHARS_PER_TOKEN=4
-// under-estimates text savings; the gate multiplies the image cost by
+// hardcoded provider formula. Constants bias CONSERVATIVE: CHARS_PER_TOKEN
+// sits above the measured density, under-estimating text savings; the gate
+// multiplies the image cost by
 // GATE_MARGIN on top. Mispredictions leave money on the table; they never
 // generate net-loss images.
 
-/** English ~4 chars per token average (conservative for code/JSON content). */
-const CHARS_PER_TOKEN = 4;
+/** Chars-per-token for reminder/tool_result gate buckets. Was 4 (English prose
+ *  average); a 77k-request fit over production events.jsonl (2026-08, joint
+ *  text+pixel OLS via `fitCpt` in src/core/cpt-fit.ts) measured ~2.3 for the mixed
+ *  JSON/log content that actually hits this gate. 3 keeps a conservative margin
+ *  above the measurement while halving the prior under-pricing of text cost. */
+const CHARS_PER_TOKEN = 3;
 
 /** Empirical cpt for the system-slab path (Opus 4.7 tokenizer, N=391, observed 1.91).
- *  Slab-specific because reminders/tool_results have unknown shape; those stay at 4. */
+ *  Slab-specific because reminders/tool_results have unknown shape; those use CHARS_PER_TOKEN. */
 export const SLAB_CHARS_PER_TOKEN = 2.0;
 
 // Tools whose stub description keeps a live-text read-before-edit precondition
