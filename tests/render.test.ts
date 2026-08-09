@@ -1298,8 +1298,11 @@ describe('transform', () => {
     });
   });
 
-  it('strips x-anthropic-billing-header line and keeps it as text', async () => {
-    const sysText = 'x-anthropic-billing-header: cch=abc123\n' + 'real prompt text. '.repeat(2500);
+  it('strips x-anthropic-billing-header from system and re-emits it after the last user message markers', async () => {
+    // Live shape as of CLI 2.1.226: per-turn cch and cc_prev_req.
+    const HDR =
+      'x-anthropic-billing-header: cc_version=2.1.226.748; cc_entrypoint=cli; cch=fc3da; cc_prev_req=req_011CdrEEJi7ECPHAnHpEW38f;';
+    const sysText = HDR + '\n' + 'real prompt text. '.repeat(2500);
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -1310,8 +1313,21 @@ describe('transform', () => {
     expect(info.compressed).toBe(true);
 
     const out = JSON.parse(new TextDecoder().decode(body));
-    const textBlocks = out.system.filter((b: any) => b.type === 'text');
-    expect(textBlocks.some((b: any) => b.text.includes('x-anthropic-billing-header'))).toBe(true);
+    // NOT in system: every system block precedes the last cache_control marker
+    // (always in messages[] on this path), so re-emitting it there voids the
+    // whole cached prefix (#180/#161: 0 cache reads, distinct prefix sha per turn).
+    const sysBlocks = Array.isArray(out.system) ? out.system : out.system ? [{ type: 'text', text: out.system }] : [];
+    expect(sysBlocks.some((b: any) => b.type === 'text' && b.text.includes('x-anthropic-billing-header'))).toBe(false);
+
+    // Kept, once, as the last block of the final user message — past every marker.
+    const users = out.messages.filter((m: any) => m.role === 'user');
+    const lastUser = users[users.length - 1];
+    const blocks = Array.isArray(lastUser.content) ? lastUser.content : [];
+    const hits = blocks.filter((b: any) => b.type === 'text' && b.text.includes('x-anthropic-billing-header'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0].text).toBe(HDR);
+    expect(blocks[blocks.length - 1]).toBe(hits[0]);
+    expect(blocks[blocks.length - 1].cache_control).toBeUndefined();
   });
 
   // The billing header is per-turn on CLI >= 2.1.222, so the slab must render
@@ -1363,7 +1379,7 @@ describe('transform', () => {
       expect(await slabOf(`${CLEAN}\n${HDR}`)).toBe(await slabOf(CLEAN));
     });
 
-    it('relocates the header to the system tail from every position', async () => {
+    it('moves the header past the cache markers from every position', async () => {
       for (const system of [`${HDR}\n${CLEAN}`, `${HEAD}\n${HDR}\n${TAIL}`, `${CLEAN}\n${HDR}`]) {
         const bytes = new TextEncoder().encode(
           JSON.stringify({
@@ -1374,8 +1390,17 @@ describe('transform', () => {
         );
         const { body } = await transformRequest(bytes);
         const out = JSON.parse(new TextDecoder().decode(body));
-        const texts = out.system.filter((b: any) => b.type === 'text').map((b: any) => b.text);
-        expect(texts.some((t: string) => t.includes(HDR))).toBe(true);
+        // Never in system: anything before the last cache_control marker
+        // re-busts the prefix when cch/cc_prev_req churn per turn (#180).
+        const sysBlocks = Array.isArray(out.system) ? out.system : [];
+        expect(sysBlocks.some((b: any) => b.type === 'text' && b.text.includes(HDR))).toBe(false);
+        // Exactly one un-cached copy at the tail of the last user message.
+        const users = out.messages.filter((m: any) => m.role === 'user');
+        const blocks = users[users.length - 1].content;
+        const hits = blocks.filter((b: any) => b.type === 'text' && b.text.includes(HDR));
+        expect(hits).toHaveLength(1);
+        expect(blocks[blocks.length - 1]).toBe(hits[0]);
+        expect(blocks[blocks.length - 1].cache_control).toBeUndefined();
       }
     });
   });

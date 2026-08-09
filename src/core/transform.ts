@@ -1393,7 +1393,9 @@ export function extractEnvFields(dynamicText: string): EnvFields {
 }
 
 /** Strip the per-turn `x-anthropic-billing-header:` line (changes every turn;
- *  must not be baked into the image). Returned as `kept` for the system tail.
+ *  must not be baked into the image). Returned as `kept`; re-emitted after the
+ *  final user message's markers — NOT into req.system, which always precedes
+ *  the last cache_control marker and would void the whole cached prefix.
  *
  *  Claude Code sends this as its own system block, so after extractSystemText
  *  joins the blocks the line is never line 1 and a first-line-only test never
@@ -2122,7 +2124,22 @@ export async function transformRequest(
   // `429 rate_limit_error: "Error"` when it does not lead (#149). Lift it out
   // here so the assembly below can put it back in front.
   const { identity: keptIdentity, kept: sysRemainder } = liftIdentityBlock(rawSysRemainder);
-  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  let { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  // When another system block carries cache_control, the billing block is
+  // un-marked, so extractSystemText routes it to `kept` and the strip above
+  // never sees it — sysRemainder would re-emit it into req.system, inside the
+  // cached span. Excise it from the remainder blocks too.
+  if (Array.isArray(sysRemainder)) {
+    for (let i = sysRemainder.length - 1; i >= 0; i--) {
+      const blk = sysRemainder[i] as any;
+      if (!blk || blk.type !== 'text' || typeof blk.text !== 'string') continue;
+      const r = stripBillingLine(blk.text);
+      if (r.kept === null) continue;
+      billingLine ??= r.kept; // never emit the per-turn line twice
+      if (r.body.trim() === '') sysRemainder.splice(i, 1);
+      else sysRemainder[i] = { ...blk, text: r.body };
+    }
+  }
   // `# Environment` (working dir, git status, model ID) churns per turn but has
   // no XML wrapper, so the static/dynamic split would bake it into the slab PNG
   // and a one-file edit would re-render the whole prefix. Pull it out first; it
@@ -2439,10 +2456,13 @@ export async function transformRequest(
     if (preservedIdentity) {
       sysTail.push({ type: 'text', text: preservedIdentity });
     }
-    // billingLine carries `cc_prev_req` on CLI >= 2.1.222, so it changes every
-    // turn. It sits with the other churny blocks below, after the anchor and
-    // outside the slab, where per-turn drift costs nothing.
-    if (billingLine) sysTail.push({ type: 'text', text: billingLine });
+    // billingLine is NOT re-emitted here. req.system precedes messages[] in
+    // Anthropic's cache-prefix order, so every system block sits inside the
+    // span covered by the LAST cache_control marker (always in messages[] on
+    // this path — see cachePrefixDigest). #180/#161 put the line here believing
+    // "after the anchor"; telemetry showed 0 cache reads and 509/509 distinct
+    // cachePrefixSha8 per day. It re-enters after the final user message's
+    // markers, below, past every marked span.
     if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
     if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
@@ -2831,6 +2851,28 @@ export async function transformRequest(
         }
       }
       if (changed) msg.content = rewritten;
+    }
+  }
+
+  // Re-emit the volatile billing line OUTSIDE every marked span: appended as
+  // the last block of the final user message, which is at or after the last
+  // cache_control marker, so its per-turn churn (`cc_prev_req` on CLI >=
+  // 2.1.222) costs zero cached bytes. Placed before cachePrefixDigest so the
+  // digest sees the final shape and a regression here shows up as the marked
+  // span covering this block (position invariant in billing-line-cache.test.ts).
+  // No user message (never seen from Claude Code) => drop the line rather than
+  // re-poison req.system.
+  if (billingLine) {
+    const msgs = req.messages ?? [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]!;
+      if (m.role !== 'user') continue;
+      const content = Array.isArray(m.content)
+        ? m.content
+        : [{ type: 'text' as const, text: String(m.content ?? '') }];
+      content.push({ type: 'text', text: billingLine });
+      m.content = content;
+      break;
     }
   }
 
