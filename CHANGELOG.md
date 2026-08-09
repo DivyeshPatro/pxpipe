@@ -7,6 +7,11 @@ behavioral changes, patch = fixes).
 ## Unreleased
 
 ### Added
+- `pxpipe stats [--json] [--file <p>]` — offline summary of the events log with
+  no proxy server running (restores after-the-fact analysis the dashboard only
+  offers while live). Adds a measured-savings headline (`count_tokens` baseline
+  vs real usage over probe-OK rows only); the same fields are exposed on
+  `/api/stats.json`.
 - Documented routing to Novita's OpenAI-compatible endpoint via the existing
   `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path).
 

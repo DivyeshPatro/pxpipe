@@ -260,6 +260,32 @@ returns the originals of imaged blocks. Pure-JS runtime (Node and
 edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
 `src/core/index.ts`.
 
+<details>
+<summary><strong>Offline stats (no proxy): <code>pxpipe stats</code></strong></summary>
+
+The live dashboard shows savings while the proxy is running. To read the same
+event log **after the fact** — with no server up — summarize it straight from
+disk:
+
+```bash
+pxpipe stats                   # human report from ~/.pxpipe/events.jsonl
+pxpipe stats --json            # same aggregate as machine-readable JSON
+pxpipe stats --file /path/to/events.jsonl
+```
+
+Alongside request counts, compression ratios, latency percentiles, and
+cache-hit rates, the report prints a **measured savings** headline —
+`count_tokens` of the original body versus real usage, over probe-measured rows
+only (unmeasured requests are excluded, never counted as zero). This is a
+**raw-token** figure (cache reads at face value, not cost-weighted), so it is
+deliberately a different quantity from the dashboard's cost-weighted saved %.
+Point it at a non-default log with `--file`, or set `PXPIPE_LOG`.
+
+Exit codes: `0` report printed, `1` events file not found, `2` file present but
+no valid events. `pxpipe stats --help` prints usage.
+
+</details>
+
 ## Development
 
 ```bash
