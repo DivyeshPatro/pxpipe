@@ -48,6 +48,9 @@ https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/v1
 
 ### Novita (OpenAI-compatible)
 
+> Community-contributed example. Not tested or endorsed by pxpipe; any
+> OpenAI-compatible provider works the same way.
+
 Novita exposes an OpenAI-compatible endpoint, so it goes through the same
 `OPENAI_UPSTREAM` / `OPENAI_MODELS` route as OpenAI itself — no separate flag:
 
