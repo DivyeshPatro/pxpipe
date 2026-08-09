@@ -4,6 +4,34 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+### Fixed
+- The per-turn billing line is forwarded as a real HTTP header on the upstream
+  request instead of being re-emitted into the body. Re-emitting placed
+  volatile text inside the conversation, which leaked into imaged slabs and
+  glued the billing line onto the next user message.
+
+## 0.12.1 — 2026-08-08
+
+### Fixed
+- The churning billing line is moved past the cache markers, so it no longer
+  invalidates the cached prefix on every turn.
+- Image budgeting counts decoded image bytes, not just image count, so many
+  small images can no longer blow past the byte budget (#201).
+- History is collapsed before tool results are imaged, so already-collapsed
+  content is not re-imaged at full size (#198).
+- `total_tokens` is classified as a dynamic block instead of cacheable
+  content (#202).
+- Inbound request bodies are bounded before allocating (#199).
+- OpenAI-route credentials are decided by an explicit policy instead of
+  header sniffing (#200).
+- `restart` only stops the proxy serving this checkout's port, not every
+  pxpipe on the machine (#205).
+
+### Changed
+- Docs state the model default the runtime actually applies (#203).
+
 ## 0.12.0 — 2026-08-06
 
 ### Fixed
