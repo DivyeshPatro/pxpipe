@@ -1682,6 +1682,20 @@ export function createProxy(config: ProxyConfig = {}) {
 
     applyGatewayHeaders(outHeaders);
 
+    // Claude Code smuggles its volatile per-turn billing line inside system
+    // text. transform.ts strips it from the body (no body position is both
+    // cache-safe and invisible — see the billingLine comments there) and hands
+    // it up; it travels upstream as the HTTP header it names.
+    if (info?.billingLine) {
+      const sep = info.billingLine.indexOf(':');
+      if (sep > 0) {
+        outHeaders.set(
+          info.billingLine.slice(0, sep).trim().toLowerCase(),
+          info.billingLine.slice(sep + 1).trim(),
+        );
+      }
+    }
+
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.

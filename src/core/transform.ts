@@ -595,6 +595,11 @@ export interface TransformInfo {
   pinChars?: number;
   /** Pin folding threw and was skipped. The body still goes out unpinned. */
   pinError?: string;
+  /** Claude Code's volatile per-turn billing line, stripped from the body.
+   *  The proxy forwards it as a real HTTP header on the upstream request.
+   *  Any body position at-or-after the last cache_control marker renders as
+   *  user-attributed text; any earlier position busts the cached prefix. */
+  billingLine?: string;
   /** OpenAI Responses only: local o200k decomposition of the ORIGINAL request
    *  before pxpipe rewrites it. No provider count_tokens call. Categories are
    *  mutually exclusive text-token estimates; imageParts counts native images. */
@@ -2461,8 +2466,8 @@ export async function transformRequest(
     // span covered by the LAST cache_control marker (always in messages[] on
     // this path — see cachePrefixDigest). #180/#161 put the line here believing
     // "after the anchor"; telemetry showed 0 cache reads and 509/509 distinct
-    // cachePrefixSha8 per day. It re-enters after the final user message's
-    // markers, below, past every marked span.
+    // cachePrefixSha8 per day. It leaves the body entirely: exported via
+    // info.billingLine and sent as a real HTTP header (src/core/proxy.ts).
     if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
     if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
@@ -2854,27 +2859,15 @@ export async function transformRequest(
     }
   }
 
-  // Re-emit the volatile billing line OUTSIDE every marked span: appended as
-  // the last block of the final user message, which is at or after the last
-  // cache_control marker, so its per-turn churn (`cc_prev_req` on CLI >=
-  // 2.1.222) costs zero cached bytes. Placed before cachePrefixDigest so the
-  // digest sees the final shape and a regression here shows up as the marked
-  // span covering this block (position invariant in billing-line-cache.test.ts).
-  // No user message (never seen from Claude Code) => drop the line rather than
-  // re-poison req.system.
-  if (billingLine) {
-    const msgs = req.messages ?? [];
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]!;
-      if (m.role !== 'user') continue;
-      const content = Array.isArray(m.content)
-        ? m.content
-        : [{ type: 'text' as const, text: String(m.content ?? '') }];
-      content.push({ type: 'text', text: billingLine });
-      m.content = content;
-      break;
-    }
-  }
+  // The volatile billing line is NOT re-emitted into the body at all. There is
+  // no safe body position: req.system precedes the last cache_control marker
+  // (#180/#161: 0 cache reads, 509/509 distinct cachePrefixSha8/day), and
+  // appending after the final user message's markers renders it as
+  // user-attributed text in the conversation (the leak this replaced). It is a
+  // header by name and by nature — the proxy forwards `info.billingLine` as a
+  // real HTTP header on the upstream request (src/core/proxy.ts), where its
+  // per-turn churn (`cc_prev_req` on CLI >= 2.1.222) touches no cached bytes.
+  if (billingLine) info.billingLine = billingLine;
 
   info.compressed = true;
   // Attribution signal for prompt-cache busts (#11): digest the exact pinned

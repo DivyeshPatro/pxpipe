@@ -8,11 +8,13 @@
  * voided the whole prefix (telemetry: 0 cache reads, 509/509 distinct
  * cachePrefixSha8 per day).
  *
- * The contract tested here is POSITION-INVARIANT: we don't assert which block
- * the line lands in, only that it lands strictly AFTER every cache_control
- * marker in the flattened request order, and that the bytes at or before the
- * last marker are identical across two requests that differ only in the
- * billing line.
+ * The #206 fix re-emitted the line after the final user message's markers —
+ * cache-safe, but it rendered as user-attributed conversation text (the
+ * transcript leak). There is no body position that is both cache-safe and
+ * invisible, so the contract is now: the line appears NOWHERE in the outgoing
+ * body, is exported via info.billingLine (the proxy forwards it as a real
+ * HTTP header), and the bytes at or before the last marker are identical
+ * across two requests that differ only in the billing line.
  *
  * Run just this file:  pnpm vitest run tests/billing-line-cache.test.ts
  */
@@ -64,18 +66,16 @@ function flatten(out: Uint8Array): any[] {
 const isBilling = (b: any) => typeof b?.text === 'string' && b.text.includes('x-anthropic-billing-header:');
 
 describe('billing line vs cached prefix', () => {
-  it('lands strictly after every cache_control marker, never in system', async () => {
-    const { body: out } = await transformRequest(ccBody());
+  it('never appears in the outgoing body; exported via info.billingLine', async () => {
+    const { body: out, info } = await transformRequest(ccBody({ turn: 1 }));
     const blocks = flatten(out);
 
-    const billingIdxs = blocks.flatMap((b, i) => (isBilling(b) ? [i] : []));
-    expect(billingIdxs).toHaveLength(1); // exactly once, not duplicated
+    expect(blocks.some(isBilling)).toBe(false); // nowhere in the body
 
     const lastMarker = blocks.reduce((acc, b, i) => (b?.cache_control ? i : acc), -1);
     expect(lastMarker).toBeGreaterThanOrEqual(0); // markers survived the transform
-    expect(billingIdxs[0]).toBeGreaterThan(lastMarker); // outside every marked span
 
-    expect(blocks[billingIdxs[0]].__sys).toBeUndefined(); // and not via req.system
+    expect(info.billingLine).toBe(BILLING(1)); // handed to the proxy for the HTTP envelope
   });
 
   it('bytes at or before the last marker are invariant under billing churn', async () => {
@@ -91,10 +91,11 @@ describe('billing line vs cached prefix', () => {
     expect(b.info.cachePrefixSha8).toBe(a.info.cachePrefixSha8); // … and the digest agrees
   });
 
-  it('drops the line rather than re-poison system when no user message exists', async () => {
-    const { body: out } = await transformRequest(
+  it('stays out of the body even when no user message exists', async () => {
+    const { body: out, info } = await transformRequest(
       ccBody({ messages: [{ role: 'assistant', content: 'prefill only: ' + big(3500) }] }),
     );
     expect(flatten(out).some(isBilling)).toBe(false);
+    expect(info.billingLine).toBe(BILLING(1)); // still forwarded as a header
   });
 });
