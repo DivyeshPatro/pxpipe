@@ -21,7 +21,7 @@ const BIG_SYSTEM = Array.from({ length: 500 }, (_, i) =>
 ).join('\n');
 
 const BODY = JSON.stringify({
-  model: 'claude-opus-5', // must be in the default PXPIPE_MODELS scope or nothing compresses
+  model: 'claude-fable-5', // in DEFAULT_MODEL_BASES; opus-5 is not in the default scope
   messages: [{ role: 'user', content: 'hi' }],
   system: BIG_SYSTEM,
 });
