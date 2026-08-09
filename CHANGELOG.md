@@ -4,22 +4,34 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
-## Unreleased
+## 0.13.0 — 2026-08-09
 
 ### Added
 - `pxpipe stats [--json] [--file <p>]` — offline summary of the events log with
   no proxy server running (restores after-the-fact analysis the dashboard only
   offers while live). Adds a measured-savings headline (`count_tokens` baseline
   vs real usage over probe-OK rows only); the same fields are exposed on
-  `/api/stats.json`.
+  `/api/stats.json` (#172).
+- Per-content-class render geometry for collapsed history: static slab and
+  tool-result pages keep dense geometry; conversation history can use a
+  separate profile (#170).
 - Documented routing to Novita's OpenAI-compatible endpoint via the existing
-  `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path).
+  `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path) (#166).
+
+### Changed
+- Misread-prone Claude models get legible history geometry by default instead
+  of opt-in.
 
 ### Fixed
 - The per-turn billing line is forwarded as a real HTTP header on the upstream
   request instead of being re-emitted into the body. Re-emitting placed
   volatile text inside the conversation, which leaked into imaged slabs and
   glued the billing line onto the next user message.
+- Hardened credential and request handling on the proxy path (#167).
+- The eval harness runs on Windows and no longer quotes prices for unknown
+  models (#159).
+- `build.mjs` resolves `tsc` via `typescript/package.json` instead of the
+  removed `./bin/tsc` export, fixing builds on newer TypeScript.
 
 ## 0.12.1 — 2026-08-08
 
