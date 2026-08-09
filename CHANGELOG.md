@@ -10,6 +10,71 @@ behavioral changes, patch = fixes).
 - Documented routing to Novita's OpenAI-compatible endpoint via the existing
   `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path).
 
+### Fixed
+- The per-turn billing line is forwarded as a real HTTP header on the upstream
+  request instead of being re-emitted into the body. Re-emitting placed
+  volatile text inside the conversation, which leaked into imaged slabs and
+  glued the billing line onto the next user message.
+
+## 0.12.1 — 2026-08-08
+
+### Fixed
+- The churning billing line is moved past the cache markers, so it no longer
+  invalidates the cached prefix on every turn.
+- Image budgeting counts decoded image bytes, not just image count, so many
+  small images can no longer blow past the byte budget (#201).
+- History is collapsed before tool results are imaged, so already-collapsed
+  content is not re-imaged at full size (#198).
+- `total_tokens` is classified as a dynamic block instead of cacheable
+  content (#202).
+- Inbound request bodies are bounded before allocating (#199).
+- OpenAI-route credentials are decided by an explicit policy instead of
+  header sniffing (#200).
+- `restart` only stops the proxy serving this checkout's port, not every
+  pxpipe on the machine (#205).
+
+### Changed
+- Docs state the model default the runtime actually applies (#203).
+
+## 0.12.0 — 2026-08-06
+
+### Fixed
+- The per-turn billing header no longer lands in the cached prefix. It changed
+  on every turn and sat ahead of the stable content, so each turn invalidated
+  the prefix behind it and forced a full re-read. This was the dominant source
+  of cache churn (#180, #161).
+- Tag scanning walks by index instead of backtracking regexes, so a pattern
+  that only matched the first occurrence no longer leaves later tags in the
+  imaged slab (#176).
+- Refusals and empty messages no longer force page breaks in OpenAI history
+  collapse (#178).
+- `keepTail:0` in mixed Responses collapse protected every message instead of
+  none, defeating the collapse entirely (#154).
+- System pins now appear in the Anthropic pin listing.
+- `restart` no longer puts a `case` inside `$( )`, which breaks macOS bash 3.2.
+
+### Added
+- `warp` runs agents through a CONNECT proxy instead of overriding
+  `ANTHROPIC_BASE_URL`, so agents that ignore the env var are still routed
+  (#156).
+- `warp` matches routes on host:port and accepts `--route` (#175).
+- Pin commands are read from the system prompt, and pin instructions are
+  placed where the model actually reads them (#155).
+
+### Changed
+- `claude-opus-5` is no longer in the default model list (#163).
+- `warp` takes the child process down with it on exit.
+
+### Security
+- Added a disclosure policy, a threat model, and a CI audit gate (#164).
+- Pinned trusted supply-chain inputs: actions by immutable SHA, exact Node and
+  npm versions, `--frozen-lockfile --ignore-scripts`, and a release gate that
+  verifies the tag matches `package.json` and descends from the default
+  branch (#169).
+- Bumped postcss to 8.5.24 (GHSA-r28c-9q8g-f849).
+
+## 0.11.0 — 2026-07-25
+
 ### Changed
 - Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
   pilot preserved gist and guard checks, read 7/8 exact values, and produced no

@@ -60,6 +60,10 @@ interface RuntimeConfig {
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
+  /** Ceiling on a buffered inbound request body. Unset leaves the core default
+   *  (16 MiB). Raise it only if a real client needs more; the default binding is
+   *  loopback, but HOST can expose this process to a network. */
+  maxRequestBytes?: number;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -186,7 +190,24 @@ function parseCli(argv: string[]): RuntimeConfig {
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
+    maxRequestBytes: parseMaxRequestBytes(process.env.PXPIPE_MAX_REQUEST_BYTES),
   };
+}
+
+/** A bad limit exits instead of being ignored. The core also refuses to treat a
+ *  broken value as "no limit", but a host that was asked for 8MB and silently ran
+ *  at 16 would be a worse answer than a startup error. */
+function parseMaxRequestBytes(value: string | undefined): number | undefined {
+  const raw = value?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  const bytes = Number(raw);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+    console.error(
+      `[pxpipe] PXPIPE_MAX_REQUEST_BYTES must be a positive whole number of bytes, got: ${value}`,
+    );
+    process.exit(2);
+  }
+  return bytes;
 }
 
 function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
@@ -202,9 +223,14 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
-  pxpipe warp -- CMD    run CMD behind the proxy without a custom base URL, so
+  pxpipe warp [--route PATTERN=TARGET]... -- CMD
+                        run CMD behind the proxy without a custom base URL, so
                         client-side first-party gates (/remote-control,
-                        claude.ai connectors) keep working
+                        claude.ai connectors) keep working.
+                        api.anthropic.com/v1/messages is routed by default;
+                        --route adds rules for agents that talk to another
+                        base URL, e.g.
+                          --route '127.0.0.1:8082/v1/*=http://127.0.0.1:47821'
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -245,6 +271,10 @@ Environment:
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
+                          (default 64 MiB). Frozen history chunks are
+                          byte-identical across turns, so re-rendering them is
+                          wasted CPU; 0 disables the cache.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -1005,7 +1035,9 @@ async function runExport(argv: string[]): Promise<void> {
 
   // Write artifacts
   for (const artifact of result.artifacts) {
-    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data);
+    // The bundle contains source and prompt-derived content. mkdtemp creates
+    // its directory owner-only; keep each artifact owner-only as well.
+    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data, { mode: 0o600 });
   }
 
   // Print report
@@ -1031,11 +1063,34 @@ async function main(): Promise<void> {
   // traffic into the pxpipe already running. It starts no proxy of its own, so
   // it exits through its own branch below rather than falling through here.
   let warpCommand: string[] | undefined;
+  const warpRoutes: string[] = [];
   let cliArgv = argv;
   if (argv[0] === 'warp') {
     const sep = argv.indexOf('--');
     warpCommand = sep < 0 ? [] : argv.slice(sep + 1);
-    cliArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    // warp's own flags live before the `--`; parseCli accepts none of them, so
+    // they are consumed here rather than passed through.
+    const warpArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    const rest: string[] = [];
+    for (let i = 0; i < warpArgv.length; i += 1) {
+      const a = warpArgv[i]!;
+      if (a === '--route') {
+        const spec = warpArgv[i + 1];
+        if (spec === undefined) {
+          console.error('[pxpipe] warp: --route needs PATTERN=TARGET');
+          process.exit(2);
+        }
+        warpRoutes.push(spec);
+        i += 1;
+        continue;
+      }
+      if (a.startsWith('--route=')) {
+        warpRoutes.push(a.slice('--route='.length));
+        continue;
+      }
+      rest.push(a);
+    }
+    cliArgv = rest;
   }
   // Stats / sessions / cleanup tools live in the dashboard
   // (see http://127.0.0.1:${port}/).
@@ -1046,13 +1101,39 @@ async function main(): Promise<void> {
   // does the transforming, the tracking and the dashboard. Everything below —
   // tracker, proxy pipeline, listener — belongs to that instance, not to us.
   if (warpCommand) {
-    createWarpRuntime({ port: opts.port }).launch(warpCommand);
+    createWarpRuntime({ port: opts.port, routes: warpRoutes }).launch(warpCommand);
     return;
   }
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
+  }
+  // Subscription bearers expire. A client that froze its bearer at startup — a
+  // container handed CLAUDE_CODE_OAUTH_TOKEN as an env var — cannot renew one,
+  // so its max session length is the token's remaining life. When this is set we
+  // resolve the bearer per request from the file instead, which keeps rotation
+  // on the host with a single writer: N parallel containers refreshing their own
+  // copies would rotate each other's credential out from under them.
+  // Cached on mtime, so it costs a stat per request rather than a read.
+  const authTokenFile = process.env.ANTHROPIC_OAUTH_TOKEN_FILE?.trim() || undefined;
+  let authTokenCache: { mtimeMs: number; token: string } | undefined;
+  const anthropicAuthToken = authTokenFile
+    ? (): string | undefined => {
+        try {
+          const { mtimeMs } = fs.statSync(authTokenFile);
+          if (authTokenCache?.mtimeMs !== mtimeMs) {
+            authTokenCache = { mtimeMs, token: fs.readFileSync(authTokenFile, 'utf8').trim() };
+          }
+          return authTokenCache.token || undefined;
+        } catch {
+          // Mid-rotation the writer may have unlinked it; last good beats none.
+          return authTokenCache?.token;
+        }
+      }
+    : undefined;
+  if (authTokenFile) {
+    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
   }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
@@ -1108,6 +1189,7 @@ async function main(): Promise<void> {
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
   const config: ProxyConfig = {
+    authToken: anthropicAuthToken,
     provider: opts.provider,
     gatewayBaseUrl: opts.gatewayBaseUrl,
     gatewayHeaders: opts.gatewayHeaders,
@@ -1119,6 +1201,7 @@ async function main(): Promise<void> {
     openAIModels: opts.openAIModels,
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
+    maxRequestBytes: opts.maxRequestBytes,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1173,8 +1256,25 @@ async function main(): Promise<void> {
         e.usage !== undefined
           ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
           : '';
+      // Split the wall clock into the half we control and the half we don't:
+      // `tx` is local render+encode, the remainder is upstream. Without this the
+      // duration alone can't distinguish our CPU from a slow provider.
+      //
+      // `fb` further splits the upstream half: request start → response headers,
+      // so it covers upload + provider queue/processing but NOT generation. With
+      // all three, `fb - tx` isolates how much a large image payload costs to put
+      // on the wire, which is the number that decides whether shrinking IDATs pays.
+      const timingParts = [`${e.durationMs}ms`];
+      if (e.transformMs !== undefined) {
+        timingParts.push(
+          `tx=${e.transformMs}ms`,
+          `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
+        );
+      }
+      if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
+      const timing = timingParts.join(' ');
       console.log(
-        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
+        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
       );
 
       // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;

@@ -1298,8 +1298,11 @@ describe('transform', () => {
     });
   });
 
-  it('strips x-anthropic-billing-header line and keeps it as text', async () => {
-    const sysText = 'x-anthropic-billing-header: cch=abc123\n' + 'real prompt text. '.repeat(2500);
+  it('strips x-anthropic-billing-header from the body entirely and exports it via info.billingLine', async () => {
+    // Live shape as of CLI 2.1.226: per-turn cch and cc_prev_req.
+    const HDR =
+      'x-anthropic-billing-header: cc_version=2.1.226.748; cc_entrypoint=cli; cch=fc3da; cc_prev_req=req_011CdrEEJi7ECPHAnHpEW38f;';
+    const sysText = HDR + '\n' + 'real prompt text. '.repeat(2500);
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -1310,8 +1313,99 @@ describe('transform', () => {
     expect(info.compressed).toBe(true);
 
     const out = JSON.parse(new TextDecoder().decode(body));
-    const textBlocks = out.system.filter((b: any) => b.type === 'text');
-    expect(textBlocks.some((b: any) => b.text.includes('x-anthropic-billing-header'))).toBe(true);
+    // Nowhere in the body. In system it precedes the last cache_control marker
+    // and voids the whole cached prefix (#180/#161: 0 cache reads, distinct
+    // prefix sha per turn). After the final user message's markers it renders
+    // as user-attributed conversation text — the transcript leak. The proxy
+    // sends it as a real HTTP header instead (src/core/proxy.ts).
+    const texts: string[] = [];
+    const walk = (node: any): void => {
+      if (Array.isArray(node)) return void node.forEach(walk);
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.text === 'string') texts.push(node.text);
+      Object.values(node).forEach(walk);
+    };
+    walk(out);
+    expect(texts.some((t) => t.includes('x-anthropic-billing-header'))).toBe(false);
+    expect(info.billingLine).toBe(HDR);
+  });
+
+  // The billing header is per-turn on CLI >= 2.1.222, so the slab must render
+  // the SAME bytes whether the header is present or not, and wherever it sits.
+  // Asserting on slab bytes (not just "the line came back as text") is what
+  // catches an off-by-one newline: a stray leading \n or two spliced lines both
+  // re-render the PNG every turn and void the cached prefix.
+  describe('billing header never reaches the slab', () => {
+    const slabOf = async (system: string): Promise<string> => {
+      const bytes = new TextEncoder().encode(
+        JSON.stringify({
+          model: 'claude-3-5-sonnet',
+          messages: [{ role: 'user', content: 'hi' }],
+          system,
+        }),
+      );
+      const { body, info } = await transformRequest(bytes);
+      expect(info.compressed).toBe(true);
+      const out = JSON.parse(new TextDecoder().decode(body));
+      // A pure-static system string lands the slab on messages[0], not on
+      // `system`, so collect every image in the body rather than guessing.
+      const data: string[] = [];
+      const walk = (node: any): void => {
+        if (Array.isArray(node)) return void node.forEach(walk);
+        if (!node || typeof node !== 'object') return;
+        if (node.type === 'image' && node.source?.data) data.push(node.source.data);
+        Object.values(node).forEach(walk);
+      };
+      walk(out);
+      expect(data.length).toBeGreaterThan(0);
+      return data.join('');
+    };
+    const HDR = 'x-anthropic-billing-header: cc_version=2.1.222; cc_prev_req=req_011Cdk3';
+    const HEAD = 'real prompt text. '.repeat(1250);
+    const TAIL = 'more ground truth. '.repeat(1250);
+    const CLEAN = `${HEAD}\n${TAIL}`;
+
+    it('renders identical slab bytes when the header leads the system text', async () => {
+      expect(await slabOf(`${HDR}\n${CLEAN}`)).toBe(await slabOf(CLEAN));
+    });
+
+    it('renders identical slab bytes when the header sits mid-text', async () => {
+      // Claude Code sends this as its own system block, so after the blocks are
+      // joined the header is typically NOT line 1 — the case #177 missed.
+      expect(await slabOf(`${HEAD}\n${HDR}\n${TAIL}`)).toBe(await slabOf(CLEAN));
+    });
+
+    it('renders identical slab bytes when the header ends the system text', async () => {
+      expect(await slabOf(`${CLEAN}\n${HDR}`)).toBe(await slabOf(CLEAN));
+    });
+
+    it('removes the header from the body from every position', async () => {
+      for (const system of [`${HDR}\n${CLEAN}`, `${HEAD}\n${HDR}\n${TAIL}`, `${CLEAN}\n${HDR}`]) {
+        const bytes = new TextEncoder().encode(
+          JSON.stringify({
+            model: 'claude-3-5-sonnet',
+            messages: [{ role: 'user', content: 'hi' }],
+            system,
+          }),
+        );
+        const { body, info } = await transformRequest(bytes);
+        const out = JSON.parse(new TextDecoder().decode(body));
+        // Never in system: anything before the last cache_control marker
+        // re-busts the prefix when cch/cc_prev_req churn per turn (#180).
+        // Never after the markers either: that rendered as user-attributed
+        // conversation text. Exported for the HTTP envelope instead.
+        const texts: string[] = [];
+        const walk = (node: any): void => {
+          if (Array.isArray(node)) return void node.forEach(walk);
+          if (!node || typeof node !== 'object') return;
+          if (typeof node.text === 'string') texts.push(node.text);
+          Object.values(node).forEach(walk);
+        };
+        walk(out);
+        expect(texts.some((t) => t.includes(HDR))).toBe(false);
+        expect(info.billingLine).toBe(HDR);
+      }
+    });
   });
 
   it('keeps <env> as text outside the image so cache_control stays stable', async () => {

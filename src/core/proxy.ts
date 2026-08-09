@@ -3,6 +3,7 @@
  * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
+import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
@@ -37,6 +38,11 @@ export interface ProxyConfig {
   upstream?: string;
   /** Override or supply an API key. If unset, we forward whatever the client sent. */
   apiKey?: string;
+  /** Override the Anthropic `authorization` bearer. Pass a function to re-resolve
+   *  per request: subscription tokens expire, and a client that froze its bearer
+   *  at startup (a container env var) cannot renew one mid-run. Resolving here
+   *  keeps rotation on the host, with a single writer. */
+  authToken?: string | (() => string | undefined);
   /** OpenAI API base for GPT chat completions, no trailing slash. */
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
@@ -67,6 +73,18 @@ export interface ProxyConfig {
    *  fails open. Prevents one stalled request from permanently 409-ing its retries.
    *  0 disables dedupe entirely. */
   duplicateHoldMs?: number;
+  /** Hard ceiling, in bytes, on an inbound request body pxpipe will hold in
+   *  memory. Transformable routes have to read the whole body, so without a
+   *  ceiling one client decides how much the proxy allocates: a Worker or a Node
+   *  instance bound to anything other than loopback is then one long request away
+   *  from memory exhaustion. Over-limit bodies get a provider-shaped 413 before
+   *  any upstream call. Routes pxpipe only labels are never rejected by this -
+   *  they carry uploads and audio - but their model sniff is bounded too.
+   *
+   *  Defaults to {@link DEFAULT_MAX_REQUEST_BYTES}. A non-integer, zero or
+   *  negative value is ignored in favour of that default: an unusable limit must
+   *  not silently become no limit. */
+  maxRequestBytes?: number;
 }
 
 export interface ProxyEvent {
@@ -82,6 +100,10 @@ export interface ProxyEvent {
   durationMs: number;
   /** Wall-clock ms from request start to upstream response headers. */
   firstByteMs?: number;
+  /** Wall-clock ms spent in the local transform (render + encode), excluding any
+   *  upstream probe. `durationMs - transformMs` is the upstream half, so a slow
+   *  request can be attributed to our own CPU vs the provider without guessing. */
+  transformMs?: number;
   info?: TransformInfo;
   /** Usage block from Anthropic's response — input/output/cache tokens. */
   usage?: Usage;
@@ -226,6 +248,150 @@ function withClientDisconnect(
  *  transform. Chat requests naming a model are far below this; uploads that blow
  *  past it stream through unbuffered. */
 const MODEL_SNIFF_MAX_BYTES = 1 << 20;
+
+/** Default ceiling on a buffered inbound body: 16 MiB.
+ *
+ *  Chosen against what the transform actually has to hold, not against what a
+ *  provider accepts. Real Claude Code requests measured on production traffic sit
+ *  far below this even with a 400k system slab and a long tool-heavy history, so
+ *  the limit is not reachable by ordinary use. Hosts that genuinely need more can
+ *  raise it explicitly; nothing raises it implicitly. */
+export const DEFAULT_MAX_REQUEST_BYTES = 16 << 20;
+
+/** Validate a host-supplied ceiling. Garbage falls back to the default rather
+ *  than disabling the check, because "0" or NaN meaning "unlimited" is exactly
+ *  the failure mode this option exists to remove. */
+function resolveMaxRequestBytes(configured: number | undefined): number {
+  if (configured === undefined) return DEFAULT_MAX_REQUEST_BYTES;
+  if (!Number.isSafeInteger(configured) || configured <= 0) return DEFAULT_MAX_REQUEST_BYTES;
+  return configured;
+}
+
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
+}
+
+type BoundedBody =
+  | { ok: true; bytes: Uint8Array<ArrayBuffer> }
+  | { ok: false; observedBytes: number; declaredBytes?: number };
+
+/**
+ * Read a whole request body, refusing anything over `limit`.
+ *
+ * The declared `content-length` is used only as a shortcut to reject without
+ * reading a byte. It is never the authority: chunked senders omit it, and a
+ * wrong value costs the sender nothing. The streaming loop is what enforces the
+ * cap, so a body that lies about its size is bounded by the same number as one
+ * that declares nothing.
+ *
+ * Peak memory is the limit plus at most one chunk: the loop stops pulling the
+ * moment the running total crosses the line and cancels the stream instead of
+ * draining a body it has already refused.
+ */
+async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody> {
+  const declaredRaw = req.headers.get('content-length');
+  const declared = declaredRaw === null ? NaN : Number(declaredRaw);
+  const declaredBytes = Number.isFinite(declared) && declared >= 0 ? declared : undefined;
+  if (declaredBytes !== undefined && declaredBytes > limit) {
+    return { ok: false, observedBytes: 0, declaredBytes };
+  }
+
+  const body = req.body;
+  if (!body) return { ok: true, bytes: new Uint8Array(0) };
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        return { ok: false, observedBytes: total, ...(declaredBytes !== undefined ? { declaredBytes } : {}) };
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    // A client that hangs up mid-body lands here. Release the socket and let the
+    // host's error path answer, which is what an unbounded read did too.
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+  return { ok: true, bytes: concatChunks(chunks, total) };
+}
+
+/**
+ * Read at most `maxPrefix` bytes for inspection while keeping the body
+ * forwardable byte-for-byte.
+ *
+ * Used on routes pxpipe does not transform, where the only thing wanted from the
+ * body is the model name for a dashboard label. Rejecting those requests is not
+ * an option - the same route carries uploads and audio - so instead of buffering
+ * everything, the consumed prefix is replayed ahead of the untouched remainder.
+ * Memory stays at one prefix regardless of how large the upload is.
+ */
+async function sniffPrefixRestoringBody(
+  req: Request,
+  maxPrefix: number,
+): Promise<{ prefix: Uint8Array<ArrayBuffer>; body: BodyInit | null }> {
+  const body = req.body;
+  if (!body) return { prefix: new Uint8Array(0), body: null };
+
+  const reader = body.getReader();
+  const prefixChunks: Uint8Array[] = [];
+  let total = 0;
+  let exhausted = false;
+  try {
+    while (total < maxPrefix) {
+      const { done, value } = await reader.read();
+      if (done) {
+        exhausted = true;
+        break;
+      }
+      if (!value || value.byteLength === 0) continue;
+      prefixChunks.push(value);
+      total += value.byteLength;
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+
+  const prefix = concatChunks(prefixChunks, total);
+  // The whole body fit inside the prefix, so those bytes ARE the body.
+  if (exhausted) return { prefix, body: prefix };
+
+  const restored = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of prefixChunks) controller.enqueue(chunk);
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        if (value && value.byteLength > 0) controller.enqueue(value);
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return { prefix, body: restored };
+}
 
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
@@ -833,6 +999,93 @@ function isOpenAIResponsesPath(pathname: string): boolean {
   return OPENAI_RESPONSES_PATH.test(pathname);
 }
 
+function resolveAuthToken(config: ProxyConfig): string | undefined {
+  return typeof config.authToken === 'function' ? config.authToken() : config.authToken;
+}
+
+/** What the client presented, by shape only.
+ *
+ *  Classification never inspects a credential's contents beyond its prefix and
+ *  segment structure, and never reads a local token store: pxpipe does not know
+ *  or want to know which account a token belongs to. Shape is enough to decide
+ *  routing, and it is the only thing safe to decide it on. */
+export type InboundCredential =
+  | 'none'
+  /** `x-api-key`, which only Anthropic uses. */
+  | 'anthropic-key'
+  /** `Bearer sk-ant-…`: an Anthropic key or subscription token. */
+  | 'anthropic-bearer'
+  /** `Bearer <jwt>`: how Codex and ChatGPT subscription auth arrive. */
+  | 'oauth-jwt'
+  /** `Bearer sk-…` that is not Anthropic: an OpenAI-style API key. */
+  | 'api-key-bearer'
+  /** A bearer of unrecognised shape. Gateways and self-hosted upstreams use these. */
+  | 'opaque-bearer';
+
+const ANTHROPIC_BEARER_RE = /^Bearer\s+sk-ant-/i;
+const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
+/** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
+const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+
+export function classifyInboundCredential(headers: Headers): InboundCredential {
+  const authorization = headers.get('authorization') ?? '';
+  if (ANTHROPIC_BEARER_RE.test(authorization)) return 'anthropic-bearer';
+  if (JWT_BEARER_RE.test(authorization)) return 'oauth-jwt';
+  if (API_KEY_BEARER_RE.test(authorization)) return 'api-key-bearer';
+  if (authorization.trim() !== '') return 'opaque-bearer';
+  if ((headers.get('x-api-key') ?? '').trim() !== '') return 'anthropic-key';
+  return 'none';
+}
+
+/** The decision for the outgoing `authorization` header. */
+export type OutboundAuth =
+  /** Forward what the client sent, unchanged. */
+  | { action: 'keep-inbound'; reason: string }
+  /** Install the host's configured key in its place. */
+  | { action: 'replace'; reason: string }
+  /** Send no authorization at all. */
+  | { action: 'drop'; reason: string };
+
+/**
+ * Credential policy for a direct OpenAI-family route: `/v1/responses`,
+ * `/v1/chat/completions`, `/v1/models` and the provider-prefixed equivalents,
+ * where the client speaks to the OpenAI upstream itself rather than through a
+ * Messages bridge.
+ *
+ * Three rules, in priority order:
+ *
+ *  1. An Anthropic-shaped credential never reaches an OpenAI upstream. That is a
+ *     cross-provider credential disclosure, and a guaranteed 401 on top. The
+ *     route classifier already refuses this for the ambiguous `/v1/models` path;
+ *     this applies the same rule to every OpenAI route.
+ *  2. Subscription OAuth is preserved even when the host has an API key
+ *     configured. A Codex user proxying through pxpipe means to spend their own
+ *     subscription; silently substituting the host key bills the wrong account
+ *     and usually fails, and the user has no way to see why.
+ *  3. Otherwise a configured key replaces whatever arrived, and is used as the
+ *     fallback when nothing arrived. This is the documented "host supplies the
+ *     credential" mode.
+ */
+export function resolveOpenAIRouteAuth(
+  inbound: InboundCredential,
+  hasConfiguredKey: boolean,
+): OutboundAuth {
+  if (inbound === 'anthropic-bearer' || inbound === 'anthropic-key') {
+    return hasConfiguredKey
+      ? { action: 'replace', reason: 'anthropic-credential-never-crosses-providers' }
+      : { action: 'drop', reason: 'anthropic-credential-never-crosses-providers' };
+  }
+  if (inbound === 'oauth-jwt') {
+    return { action: 'keep-inbound', reason: 'subscription-oauth-belongs-to-the-caller' };
+  }
+  if (hasConfiguredKey) {
+    return { action: 'replace', reason: 'host-configured-key' };
+  }
+  return inbound === 'none'
+    ? { action: 'drop', reason: 'no-credential-available' }
+    : { action: 'keep-inbound', reason: 'caller-credential-forwarded' };
+}
+
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
   // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
@@ -954,6 +1207,7 @@ export function createProxy(config: ProxyConfig = {}) {
   const headersTimeoutMs = config.upstreamHeadersTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
   const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
   const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
+  const maxRequestBytes = resolveMaxRequestBytes(config.maxRequestBytes);
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -1007,6 +1261,8 @@ export function createProxy(config: ProxyConfig = {}) {
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
     let reqBodySha256: string | undefined;
+    // Set once the transform returns; read by fire() at event time.
+    let transformMs: number | undefined;
 
     const fire = (
       status: number,
@@ -1088,6 +1344,7 @@ export function createProxy(config: ProxyConfig = {}) {
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
+          transformMs,
           info,
           usage: eventUsage,
           error,
@@ -1143,7 +1400,26 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselineStatusApplies = false;
 
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
-      const bodyIn = new Uint8Array(await req.arrayBuffer());
+      // Transformable routes have to hold the whole body, so this is the one
+      // place a client could otherwise choose how much the proxy allocates.
+      // Refuse past the ceiling before any allocation the caller controls, and
+      // before any upstream call: a 413 the provider would have sent anyway is
+      // cheaper for everyone than an out-of-memory host.
+      const bounded = await readBodyBounded(req, maxRequestBytes);
+      if (!bounded.ok) {
+        const message =
+          `request body exceeds the ${maxRequestBytes}-byte pxpipe limit ` +
+          `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
+          `read ${bounded.observedBytes})`;
+        const error = isMessages
+          ? { type: 'error', error: { type: 'request_too_large', message } }
+          : { error: { type: 'request_too_large', message } };
+        return new Response(JSON.stringify(error), {
+          status: 413,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const bodyIn = bounded.bytes;
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
@@ -1218,6 +1494,10 @@ export function createProxy(config: ProxyConfig = {}) {
           : bridgedChatMessages
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
+        // Local render+encode cost only. The Google branch below issues upstream
+        // count_tokens probes, so the timer closes here rather than after them —
+        // otherwise network latency would be charged to our own CPU.
+        const tTransform = Date.now();
         let r = isGoogle
           ? await transformGoogleGenerateContent(bodyIn, model!, effectiveOpts)
           : isMessages
@@ -1229,6 +1509,7 @@ export function createProxy(config: ProxyConfig = {}) {
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        transformMs = Date.now() - tTransform;
         if (isGoogle && r.info.compressed) {
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
@@ -1304,6 +1585,10 @@ export function createProxy(config: ProxyConfig = {}) {
             const ctHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
             ctHeaders.set('content-type', 'application/json');
             if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+            // The probe carries the client's frozen bearer otherwise, so it 401s
+            // exactly when the main forward starts succeeding on the fresh one.
+            const ctAuth = resolveAuthToken(config);
+            if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
             // Mirror the actual outbound request base+path: count_tokens lives at
             // `<messages-path>/count_tokens`, so provider-prefixed routes like
             // `/anthropic/messages` probe `/anthropic/messages/count_tokens`.
@@ -1348,15 +1633,21 @@ export function createProxy(config: ProxyConfig = {}) {
       // before. A missing content-length is not evidence of a big body —
       // chunked clients omit it — so only an explicit over-cap declaration
       // disqualifies.
+      // A declared length over the sniff cap still disqualifies early, but it is
+      // no longer the only bound: an undeclared or under-declared body used to
+      // reach `arrayBuffer()` and buffer without limit. Now the read itself stops
+      // at the cap and the untouched remainder streams on, so the model label is
+      // best-effort and the memory cost is fixed either way.
       const declaredType = req.headers.get('content-type') ?? '';
       const declaredLength = Number(req.headers.get('content-length') ?? NaN);
-      const worthBuffering =
+      const worthSniffing =
         declaredType.toLowerCase().includes('json') &&
         !(Number.isFinite(declaredLength) && declaredLength > MODEL_SNIFF_MAX_BYTES);
-      if (worthBuffering) {
-        const bodyIn = new Uint8Array(await req.arrayBuffer());
-        requestModel ??= readModelField(bodyIn) ?? undefined;
-        bodyOut = bodyIn;
+      if (worthSniffing) {
+        const sniffCap = Math.min(MODEL_SNIFF_MAX_BYTES, maxRequestBytes);
+        const { prefix, body: restoredBody } = await sniffPrefixRestoringBody(req, sniffCap);
+        requestModel ??= readModelField(prefix) ?? undefined;
+        bodyOut = restoredBody;
       } else {
         bodyOut = req.body; // pass through unchanged, model stays unknown
       }
@@ -1366,10 +1657,8 @@ export function createProxy(config: ProxyConfig = {}) {
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
     if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
+      // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
       outHeaders.delete('x-api-key');
-      // Never forward a Messages client's bearer credential across providers.
-      // A configured upstream key is installed below; otherwise auth stays absent.
-      if (bridgedGptMessages || bridgedChatMessages) outHeaders.delete('authorization');
       const anthropicHeaders: string[] = [];
       outHeaders.forEach((_value, name) => {
         if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
@@ -1379,12 +1668,45 @@ export function createProxy(config: ProxyConfig = {}) {
       const bridgeKey = bridgedChatMessages
         ? config.cloudflareApiKey
         : config.openAIApiKey;
-      if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
-    } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
-      outHeaders.set('x-api-key', config.apiKey);
+      if (bridgedGptMessages || bridgedChatMessages) {
+        // A bridged request came in as Anthropic Messages, so whatever credential
+        // it carries is an Anthropic one by construction. Drop it unconditionally
+        // and use only what the host configured for the bridge target.
+        outHeaders.delete('authorization');
+        if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      } else {
+        // A direct OpenAI-family route. The client's own credential may be the
+        // right one to forward, so decide by shape instead of by whether a host
+        // key happens to be set. See resolveOpenAIRouteAuth for the three rules.
+        const decision = resolveOpenAIRouteAuth(
+          classifyInboundCredential(req.headers),
+          bridgeKey !== undefined && bridgeKey !== '',
+        );
+        if (decision.action === 'drop') outHeaders.delete('authorization');
+        else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+        // 'keep-inbound' leaves the header filterHeaders already copied.
+      }
+    } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
+      if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
+      const bearer = resolveAuthToken(config);
+      if (bearer) outHeaders.set('authorization', `Bearer ${bearer}`);
     }
 
     applyGatewayHeaders(outHeaders);
+
+    // Claude Code smuggles its volatile per-turn billing line inside system
+    // text. transform.ts strips it from the body (no body position is both
+    // cache-safe and invisible — see the billingLine comments there) and hands
+    // it up; it travels upstream as the HTTP header it names.
+    if (info?.billingLine) {
+      const sep = info.billingLine.indexOf(':');
+      if (sep > 0) {
+        outHeaders.set(
+          info.billingLine.slice(0, sep).trim().toLowerCase(),
+          info.billingLine.slice(sep + 1).trim(),
+        );
+      }
+    }
 
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
@@ -1543,6 +1865,21 @@ export function createProxy(config: ProxyConfig = {}) {
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
     ]).then(([usage, errorBody, measurement, stopReason]) => {
+      // A rejected request never populated a prefix cache, so the append-only
+      // freeze this session was protecting protects nothing: let the next turn
+      // re-cut the grid for density instead of preserving dead bytes.
+      if (responseLeftNoCache(upstreamRes.status, errorBody)) {
+        markCacheDead(info?.firstUserSha8);
+      }
+      // Feed the provider's own cache accounting back into the session store. A
+      // read proves the prefix was live; a create proves one was just written.
+      // Either way the next turn must not re-cut the grid — which the wall clock
+      // alone could not tell, and got wrong on most gaps that mattered.
+      noteCacheOutcome(
+        info?.firstUserSha8,
+        usage?.cache_read_input_tokens,
+        usage?.cache_creation_input_tokens,
+      );
       fire(
         upstreamRes.status,
         info,
