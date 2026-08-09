@@ -45,11 +45,17 @@ function bodyWithHistory(model: string): Uint8Array {
 }
 
 describe('per-content-class render geometry', () => {
-  it('is absent from every shipped profile, so the default path is unchanged', () => {
-    for (const m of ['claude-opus-5', 'claude-fable-5', 'gpt-5.6-sol', 'moonshotai/kimi-k3']) {
+  it('ships legible history for misread-prone Claude models by default', () => {
+    // Measured: Opus 3/26 exact at dense geometry, 100/100 at 172 cols
+    // jetbrains-mono-14. Fable read 25/26 at dense, so it keeps the 5.28x
+    // geometry; non-Claude families are untouched by this PR.
+    const opus = resolveGptProfile('claude-opus-5');
+    expect(opus.historyStripCols).toBe(172);
+    expect(opus.historyStyle?.font).toBe('jetbrains-mono-14');
+    for (const m of ['claude-fable-5', 'gpt-5.6-sol', 'moonshotai/kimi-k3']) {
       const p = resolveGptProfile(m);
-      expect(p.historyStripCols, `${m} must not opt in by default`).toBeUndefined();
-      expect(p.historyStyle, `${m} must not opt in by default`).toBeUndefined();
+      expect(p.historyStripCols, `${m} must stay dense by default`).toBeUndefined();
+      expect(p.historyStyle, `${m} must stay dense by default`).toBeUndefined();
     }
   });
 
@@ -76,22 +82,25 @@ describe('per-content-class render geometry', () => {
     expect(after.style).toEqual(before.style);
   });
 
-  it('renders history at the override geometry, costing more image tokens for the same text', async () => {
-    const body = bodyWithHistory('claude-opus-5');
-
-    const dense = await transformAnthropicMessages({ body, model: 'claude-opus-5' });
+  it('renders history at the legible geometry by default, costing more image tokens for the same text', async () => {
+    // No env override on either side: this pins the SHIPPED defaults.
+    // Fable keeps dense history; Opus gets legible out of the box.
+    const dense = await transformAnthropicMessages({
+      body: bodyWithHistory('claude-fable-5'),
+      model: 'claude-fable-5',
+    });
     expect(dense.applied, dense.reason).toBe(true);
     const denseImages = dense.info.collapsedImages ?? 0;
     expect(denseImages, 'the fixture must actually collapse history').toBeGreaterThan(0);
 
-    process.env[ENV] = JSON.stringify({
-      'claude-opus-5': { historyStripCols: 172, historyStyle: { font: 'jetbrains-mono-14' } },
+    const legible = await transformAnthropicMessages({
+      body: bodyWithHistory('claude-opus-5'),
+      model: 'claude-opus-5',
     });
-    const legible = await transformAnthropicMessages({ body, model: 'claude-opus-5' });
     expect(legible.applied, legible.reason).toBe(true);
 
-    // Same source text, larger glyphs: more pages. This is the whole trade —
-    // legibility is bought with image tokens, and the caller decides.
+    // Same source text, larger glyphs: more pages. Legibility is bought with
+    // image tokens, and for misread-prone models the default buys it.
     expect(legible.info.collapsedImages ?? 0).toBeGreaterThan(denseImages);
     expect(legible.info.collapsedChars).toBe(dense.info.collapsedChars);
   });
