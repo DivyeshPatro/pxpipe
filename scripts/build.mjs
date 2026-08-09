@@ -45,7 +45,7 @@ await build({
   outfile: 'dist/node.js',
   bundle: true,
   platform: 'node',
-  target: 'node18',
+  target: 'node20',
   format: 'esm',
   sourcemap: true,
   // Inline the package version so `pxpipe --version` is correct for global/npx
