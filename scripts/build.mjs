@@ -7,6 +7,7 @@ import { mkdir, rm, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -26,7 +27,9 @@ await mkdir(OUT, { recursive: true });
 // with shell:true trips the DEP0190 arg-escaping warning. Resolving the tsc bin
 // and invoking `node <tsc>` sidesteps both — same pattern as the smoke check
 // below, and drops the build's dependency on pnpm being the caller.
-const tscBin = require.resolve('typescript/bin/tsc');
+// TS 7 no longer exports ./bin/tsc in its package.json "exports" map, so
+// resolve the package root via ./package.json (always exported) instead.
+const tscBin = join(dirname(require.resolve('typescript/package.json')), 'bin', 'tsc');
 const tsc = spawnSync(process.execPath, [tscBin, '-p', 'tsconfig.json'], {
   stdio: 'inherit',
 });
