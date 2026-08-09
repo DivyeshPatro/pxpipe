@@ -6,6 +6,10 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Added
+- Documented routing to Novita's OpenAI-compatible endpoint via the existing
+  `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path).
+
 ### Fixed
 - The per-turn billing line is forwarded as a real HTTP header on the upstream
   request instead of being re-emitted into the body. Re-emitting placed
