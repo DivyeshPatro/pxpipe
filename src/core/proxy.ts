@@ -100,6 +100,10 @@ export interface ProxyEvent {
   durationMs: number;
   /** Wall-clock ms from request start to upstream response headers. */
   firstByteMs?: number;
+  /** Wall-clock ms spent in the local transform (render + encode), excluding any
+   *  upstream probe. `durationMs - transformMs` is the upstream half, so a slow
+   *  request can be attributed to our own CPU vs the provider without guessing. */
+  transformMs?: number;
   info?: TransformInfo;
   /** Usage block from Anthropic's response — input/output/cache tokens. */
   usage?: Usage;
@@ -1257,6 +1261,8 @@ export function createProxy(config: ProxyConfig = {}) {
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
     let reqBodySha256: string | undefined;
+    // Set once the transform returns; read by fire() at event time.
+    let transformMs: number | undefined;
 
     const fire = (
       status: number,
@@ -1338,6 +1344,7 @@ export function createProxy(config: ProxyConfig = {}) {
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
+          transformMs,
           info,
           usage: eventUsage,
           error,
@@ -1487,6 +1494,10 @@ export function createProxy(config: ProxyConfig = {}) {
           : bridgedChatMessages
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
+        // Local render+encode cost only. The Google branch below issues upstream
+        // count_tokens probes, so the timer closes here rather than after them —
+        // otherwise network latency would be charged to our own CPU.
+        const tTransform = Date.now();
         let r = isGoogle
           ? await transformGoogleGenerateContent(bodyIn, model!, effectiveOpts)
           : isMessages
@@ -1498,6 +1509,7 @@ export function createProxy(config: ProxyConfig = {}) {
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        transformMs = Date.now() - tTransform;
         if (isGoogle && r.info.compressed) {
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
