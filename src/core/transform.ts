@@ -330,15 +330,16 @@ function imageTokensCost(
  *  at a lower density than the slab without touching either default. Both are
  *  undefined in every shipped profile, so this returns the dense geometry
  *  unchanged out of the box. */
-function historyGateGeometry(o?: Required<TransformOptions>): GateGeometry {
+function historyGateGeometry(
+  o?: Required<TransformOptions>,
+  callerOverrodeCols: boolean = false,
+): GateGeometry {
   const dense = denseGateGeometry(o);
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
   if (profile?.historyStripCols === undefined && profile?.historyStyle === undefined) return dense;
   return {
     ...dense,
-    // An explicit `o.cols` is a caller override and still wins, as it does for
-    // the dense path.
-    cols: o?.cols ?? profile.historyStripCols ?? dense.cols,
+    cols: callerOverrodeCols ? o!.cols : profile.historyStripCols ?? dense.cols,
     style: profile.historyStyle ?? dense.style,
   };
 }
@@ -1945,7 +1946,7 @@ async function runHistoryCollapseAndFinalize(
     // symmetric burn would have kept the slab gate in. Production data
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
-    const historyGeometry = historyGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -1967,7 +1968,7 @@ async function runHistoryCollapseAndFinalize(
       req.messages,
       historyProfitable,
       {
-        cols: o.cols,
+        cols: historyGeometry.cols,
         protectedPrefix,
         reflow: o.reflow,
         style: historyGeometry.style,
@@ -2541,7 +2542,7 @@ export async function transformRequest(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
-    const historyGeometry = historyGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -2555,7 +2556,7 @@ export async function transformRequest(
       req.messages,
       historyProfitable,
       {
-        cols: o.cols,
+        cols: historyGeometry.cols,
         protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
         reflow: o.reflow,
         style: historyGeometry.style,
