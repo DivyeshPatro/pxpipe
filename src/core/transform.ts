@@ -1636,13 +1636,25 @@ export function truncateForBudget(
   const originalLines = lines.length;
   const originalChars = text.length;
 
+  // Reflowed text joins logical lines with the ↵ sentinel, which the renderer
+  // treats as an inline glyph that never forces a row break (see countVisualRows
+  // / wrapLines). So many ↵-segments pack into one visual row — charging one row
+  // per segment (lineRows) overstates rows ~6x and over-truncates. Charge the
+  // packed-row DELTA instead: total rows telescope to ceil(keptChars/cols),
+  // matching the renderer, while still binding the row budget for narrow columns
+  // where the char budget alone would under-truncate.
+  const reflowed = nlChar === NL_SENTINEL;
+  const packedRows = (n: number): number => Math.ceil(n / Math.max(1, cols));
+  const rowCost = (seg: string, priorChars: number, addChars: number): number =>
+    reflowed ? packedRows(priorChars + addChars) - packedRows(priorChars) : lineRows(seg, cols);
+
   if (shape === 'structured') {
     let rows = 0;
     let chars = 0;
     let cut = 0;
     for (let i = 0; i < lines.length; i++) {
-      const r = lineRows(lines[i]!, cols);
       const c = lines[i]!.length + (i > 0 ? 1 : 0);
+      const r = rowCost(lines[i]!, chars, c);
       if (rows + r > totalRowBudget || chars + c > totalCharBudget) break;
       rows += r;
       chars += c;
@@ -1677,8 +1689,8 @@ export function truncateForBudget(
   let headChars = 0;
   let headCut = 0;
   for (let i = 0; i < lines.length; i++) {
-    const r = lineRows(lines[i]!, cols);
     const c = lines[i]!.length + (i > 0 ? 1 : 0);
+    const r = rowCost(lines[i]!, headChars, c);
     if (headRows + r > headRowBudget || headChars + c > headCharBudget) break;
     headRows += r;
     headChars += c;
@@ -1689,8 +1701,8 @@ export function truncateForBudget(
   let tailChars = 0;
   let tailStart = lines.length;
   for (let i = lines.length - 1; i >= headCut; i--) {
-    const r = lineRows(lines[i]!, cols);
     const c = lines[i]!.length + (i < lines.length - 1 ? 1 : 0);
+    const r = rowCost(lines[i]!, tailChars, c);
     if (tailRows + r > tailRowBudget || tailChars + c > tailCharBudget) break;
     tailRows += r;
     tailChars += c;
