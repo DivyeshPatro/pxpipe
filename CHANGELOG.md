@@ -43,6 +43,12 @@ behavioral changes, patch = fixes).
   ceiling.
 
 ### Fixed
+- `pxpipe warp` pointed `SSL_CERT_FILE`, `CURL_CA_BUNDLE` and
+  `REQUESTS_CA_BUNDLE` at the pxpipe CA alone. Those variables replace the
+  trust store, so every other HTTPS client in the warped session (gcloud,
+  pip, gws) lost the public roots and failed verification. They now get
+  `warp-ca-bundle.pem` = pxpipe CA + system roots; `NODE_EXTRA_CA_CERTS`
+  keeps the CA-only file since Node appends (#245, #247).
 - Gemini history collapse is capped at 32 images (was 72) to prevent
   vision-side TTFT stalls on long sessions.
 - Claude Code's `cc_automode_session_rules` / `cc_automode_permissions` /
