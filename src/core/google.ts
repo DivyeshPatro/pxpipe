@@ -28,6 +28,7 @@ import {
 } from './openai.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
+import { relocateGooglePins } from './pin.js';
 
 export interface GooglePart {
   text?: string;
@@ -657,9 +658,14 @@ export async function transformGoogleGenerateContent(
   const req = reqRecord as GoogleGenerateContentRequest;
 
   const info = createDefaultInfo(modelName);
+  const pinChars = relocateGooglePins(req);
+  if (pinChars > 0) info.pinChars = pinChars;
+  const pinBody = pinChars > 0
+    ? new TextEncoder().encode(JSON.stringify(req))
+    : bodyBytes;
   if (options.compress === false) {
     info.reason = 'compression_disabled';
-    return withStampedThoughtSignatures(req, bodyBytes, info);
+    return withStampedThoughtSignatures(req, pinBody, info);
   }
 
   // Extract system instructions
@@ -667,12 +673,12 @@ export async function transformGoogleGenerateContent(
   const systemInstruction = record(req.systemInstruction);
   const systemParts = systemInstruction?.parts;
   if (systemParts !== undefined && !Array.isArray(systemParts)) {
-    return { body: bodyBytes, info };
+    return { body: pinBody, info };
   }
   if (Array.isArray(systemParts)) {
     for (const rawPart of systemParts) {
       const part = record(rawPart);
-      if (!part) return { body: bodyBytes, info };
+      if (!part) return { body: pinBody, info };
       if (typeof part.text === 'string' && part.text.trim()) {
         systemTexts.push(part.text);
         info.staticChars += part.text.length;
@@ -747,12 +753,12 @@ export async function transformGoogleGenerateContent(
   // Prepare transformed request. Plan history against the ORIGINAL contents;
   // inserting the slab image first would make content[0] an opaque image barrier.
   if (req.contents !== undefined && !Array.isArray(req.contents)) {
-    return { body: bodyBytes, info: createDefaultInfo(modelName) };
+    return { body: pinBody, info: createDefaultInfo(modelName) };
   }
   const originalContents = Array.isArray(req.contents) ? [...req.contents] : [];
   for (const content of originalContents) {
     if (!record(content) || (content.parts !== undefined && !Array.isArray(content.parts))) {
-      return { body: bodyBytes, info: createDefaultInfo(modelName) };
+      return { body: pinBody, info: createDefaultInfo(modelName) };
     }
   }
 
@@ -801,7 +807,7 @@ export async function transformGoogleGenerateContent(
     } else if (!staticProfitable) {
       info.reason = 'not_profitable';
     }
-    return withStampedThoughtSignatures(req, bodyBytes, info);
+    return withStampedThoughtSignatures(req, pinBody, info);
   }
 
   if (hasStaticCompression) {

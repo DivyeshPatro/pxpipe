@@ -43,6 +43,7 @@ import {
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
+import { relocateOpenAIPins } from './pin.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -986,11 +987,16 @@ export async function transformOpenAIChatCompletions(
     info.reason = 'parse_error: messages must be an array';
     return { body, info };
   }
+  const pinChars = relocateOpenAIPins(req);
+  if (pinChars > 0) info.pinChars = pinChars;
+  const pinBody = pinChars > 0
+    ? new TextEncoder().encode(JSON.stringify(req))
+    : body;
 
   const firstUserIdx = req.messages.findIndex((m) => m.role === 'user');
   if (firstUserIdx < 0) {
     info.reason = 'no_user_message';
-    return { body, info };
+    return { body: pinBody, info };
   }
 
   const authorityDocs: string[] = [];
@@ -1021,7 +1027,7 @@ export async function transformOpenAIChatCompletions(
       info.compressed = true;
       return { body: new TextEncoder().encode(JSON.stringify(req)), info };
     }
-    return { body, info };
+    return { body: pinBody, info };
   };
   if (!combinedRaw) {
     return finishHistoryOnly('no_static_context');
@@ -1077,7 +1083,7 @@ export async function transformOpenAIChatCompletions(
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
-    return { body, info };
+    return { body: pinBody, info };
   }
 
   // A hard provider cap makes static-first allocation pathological on long Qwen
@@ -1098,7 +1104,7 @@ export async function transformOpenAIChatCompletions(
   if (profile.providerImageCap !== undefined &&
       countRequestImages(req.messages) + images.length > profile.providerImageCap) {
     info.reason = 'provider_image_cap';
-    return { body, info };
+    return { body: pinBody, info };
   }
 
   const { droppedCodepoints } = accumulateRenderedImages(images, info);
@@ -1183,6 +1189,11 @@ export async function transformOpenAIResponses(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  const pinChars = relocateOpenAIPins(req);
+  if (pinChars > 0) info.pinChars = pinChars;
+  const pinBody = pinChars > 0
+    ? new TextEncoder().encode(JSON.stringify(req))
+    : body;
 
   // Normalize input to an array; preserve original string for wrap-back if needed.
   const inputWasString = typeof req.input === 'string';
@@ -1194,7 +1205,7 @@ export async function transformOpenAIResponses(
     inputItems = req.input as Array<ResponsesInputItem | Record<string, unknown>>;
   } else {
     info.reason = 'parse_error: input must be a string or array';
-    return { body, info };
+    return { body: pinBody, info };
   }
 
   // Find first user item index (skip non-message items like function_call_output, reasoning).
@@ -1205,7 +1216,7 @@ export async function transformOpenAIResponses(
   );
   if (!inputWasString && firstUserIdx < 0) {
     info.reason = 'no_user_message';
-    return { body, info };
+    return { body: pinBody, info };
   }
 
   info.responsesComposition = measureResponsesComposition(
@@ -1268,7 +1279,7 @@ export async function transformOpenAIResponses(
       info.reason = undefined;
       return finishSerialized();
     }
-    return { body, info };
+    return { body: pinBody, info };
   };
   if (!combinedRaw) {
     return finishHistoryOnly('no_static_context');
@@ -1324,7 +1335,7 @@ export async function transformOpenAIResponses(
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
-    return { body, info };
+    return { body: pinBody, info };
   }
 
   const { droppedCodepoints } = accumulateRenderedImages(images, info);
